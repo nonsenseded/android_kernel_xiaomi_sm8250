@@ -1,0 +1,118 @@
+name: Build kernel (munch)
+
+on:
+  push:
+    branches: [ lineage-24.0 ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  KBUILD_BUILD_USER: milk
+  KBUILD_BUILD_HOST: milkpc
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo apt-get clean
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential flex libssl-dev libelf-dev \
+            device-tree-compiler zip unzip cpio rsync python3 wget \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+
+      - name: Install LLVM 21
+        run: |
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key \
+            | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc > /dev/null
+          echo "deb https://apt.llvm.org/noble/ llvm-toolchain-noble-21 main" \
+            | sudo tee /etc/apt/sources.list.d/llvm-21.list > /dev/null
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang-21 lld-21 llvm-21
+          mkdir -p "$HOME/toolchain/bin"
+          for t in clang clang++ ld.lld llvm-ar llvm-nm llvm-objcopy llvm-objdump \
+                   llvm-readelf llvm-strip llvm-size llvm-as llvm-dis llvm-ranlib; do
+            if [ -x "/usr/bin/$t-21" ]; then
+              ln -sf "/usr/bin/$t-21" "$HOME/toolchain/bin/$t"
+            fi
+          done
+          echo "$HOME/toolchain/bin" >> "$GITHUB_PATH"
+
+      - name: Verify toolchain
+        run: |
+          clang --version
+          ld.lld --version
+          aarch64-linux-gnu-gcc --version | head -1
+
+      - name: Build kernel
+        run: |
+          JOBS="$(nproc)" bash ./build-n0.sh
+
+      - name: Fetch AnyKernel3
+        run: |
+          git init --quiet AnyKernel3
+          git -C AnyKernel3 remote add origin https://github.com/osm0sis/AnyKernel3.git
+          git -C AnyKernel3 fetch --depth=1 origin 41f04bdb4ee30a44e429c2c1131d5e8bb32b15f1
+          git -C AnyKernel3 checkout --quiet FETCH_HEAD
+
+      - name: Package AnyKernel3 zip
+        run: |
+          AK3_DIR="$PWD/AnyKernel3" bash ./package-n0.sh
+          ls -lh dist/
+
+      - name: Collect metadata
+        id: meta
+        run: |
+          REL="$(cat out-ksu/include/config/kernel.release)"
+          SHA="$(sha256sum dist/*.zip | awk '{print $1}')"
+          ZIP="$(basename "$(ls -1 dist/*.zip | head -1)")"
+          echo "release=$REL"  >> "$GITHUB_OUTPUT"
+          echo "sha256=$SHA"   >> "$GITHUB_OUTPUT"
+          echo "zip=$ZIP"      >> "$GITHUB_OUTPUT"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.meta.outputs.zip }}
+          path: dist/*.zip
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: milkii munch ${{ steps.meta.outputs.release }}
+          body: |
+            **Kernel:** `${{ steps.meta.outputs.release }}`
+            **Device:** POCO F4 (munch) / Redmi K40S (munchg)
+            **Manager:** BakaSU v4.2.0-rc3 (manual hook), SELinux hiding optional
+            **Asset:** `${{ steps.meta.outputs.zip }}`
+            **SHA256:** `${{ steps.meta.outputs.sha256 }}`
+
+            Flash the zip in OrangeFox. It patches the kernel only, so the
+            OrangeFox ramdisk (recovery-in-boot) is preserved.
+          files: |
+            dist/*.zip
+            out-ksu/arch/arm64/boot/Image
+          fail_on_unmatched_files: true
