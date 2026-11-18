@@ -18,7 +18,11 @@ env:
 
 jobs:
   build:
-    runs-on: ubuntu-24.04
+    # Ubuntu 26.04 ships clang 21.1.8 (6ubuntu1) -- the exact toolchain that
+    # produced the locally tested kernel. The apt.llvm.org experimental build
+    # of 21.1.8 generates noticeably different code, so do not switch back
+    # to ubuntu-24.04 + apt.llvm.org without testing the result on a device.
+    runs-on: ubuntu-26.04
     timeout-minutes: 240
 
     steps:
@@ -39,30 +43,21 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             bc bison build-essential flex libssl-dev libelf-dev \
             device-tree-compiler zip unzip cpio rsync python3 wget \
-            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+            clang-21 lld-21 llvm-21
 
-      - name: Install LLVM 21
+      - name: Select LLVM 21 toolchain
         run: |
-          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key \
-            | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc > /dev/null
-          echo "deb https://apt.llvm.org/noble/ llvm-toolchain-noble-21 main" \
-            | sudo tee /etc/apt/sources.list.d/llvm-21.list > /dev/null
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends clang-21 lld-21 llvm-21
-          mkdir -p "$HOME/toolchain/bin"
-          for t in clang clang++ ld.lld llvm-ar llvm-nm llvm-objcopy llvm-objdump \
-                   llvm-readelf llvm-strip llvm-size llvm-as llvm-dis llvm-ranlib; do
-            if [ -x "/usr/bin/$t-21" ]; then
-              ln -sf "/usr/bin/$t-21" "$HOME/toolchain/bin/$t"
-            fi
-          done
-          echo "$HOME/toolchain/bin" >> "$GITHUB_PATH"
+          # Use the distro clang/lld 21.1.8, not apt.llvm.org's snapshot build.
+          echo "/usr/lib/llvm-21/bin" >> "$GITHUB_PATH"
 
       - name: Verify toolchain
         run: |
           clang --version
           ld.lld --version
           aarch64-linux-gnu-gcc --version | head -1
+          clang --version | grep -q 'Ubuntu clang version 21.1.8' \
+            || echo "::warning::clang is not the expected Ubuntu 21.1.8 build"
 
       - name: Build kernel
         run: |
@@ -86,15 +81,20 @@ jobs:
           REL="$(cat out-ksu/include/config/kernel.release)"
           SHA="$(sha256sum dist/*.zip | awk '{print $1}')"
           ZIP="$(basename "$(ls -1 dist/*.zip | head -1)")"
+          CC="$(clang --version | head -1)"
           echo "release=$REL"  >> "$GITHUB_OUTPUT"
           echo "sha256=$SHA"   >> "$GITHUB_OUTPUT"
           echo "zip=$ZIP"      >> "$GITHUB_OUTPUT"
+          echo "clang=$CC"     >> "$GITHUB_OUTPUT"
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.meta.outputs.zip }}
-          path: dist/*.zip
+          path: |
+            dist/*.zip
+            out-ksu/.config
+            out-ksu/include/config/kernel.release
           if-no-files-found: error
           retention-days: 14
 
@@ -109,6 +109,7 @@ jobs:
             **Manager:** BakaSU v4.2.0-rc3 (manual hook), SELinux hiding optional
             **Asset:** `${{ steps.meta.outputs.zip }}`
             **SHA256:** `${{ steps.meta.outputs.sha256 }}`
+            **Built with:** `${{ steps.meta.outputs.clang }}`
 
             Flash the zip in OrangeFox. It patches the kernel only, so the
             OrangeFox ramdisk (recovery-in-boot) is preserved.
